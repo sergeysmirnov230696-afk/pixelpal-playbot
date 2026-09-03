@@ -22,7 +22,7 @@ export type PaykassaInvoice = {
   amount: string;
   currency: string;
   system: string;
-  tag?: string;
+  tag?: string | undefined;
 };
 
 type SciResponse = {

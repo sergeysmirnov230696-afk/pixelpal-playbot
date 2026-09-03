@@ -256,10 +256,10 @@ export const adminUpdatePlayer = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     await assertAdmin(data.playerKey);
     const db = await admin();
-    const patch: Record<string, unknown> = {};
-    if (data.balance !== undefined) patch["balance"] = data.balance;
-    if (data.referralBalance !== undefined) patch["referral_balance"] = data.referralBalance;
-    if (data.name !== undefined) patch["name"] = data.name;
+    const patch: { balance?: number; referral_balance?: number; name?: string } = {};
+    if (data.balance !== undefined) patch.balance = data.balance;
+    if (data.referralBalance !== undefined) patch.referral_balance = data.referralBalance;
+    if (data.name !== undefined) patch.name = data.name;
     if (Object.keys(patch).length > 0) {
       await db.from("players").update(patch).eq("id", data.targetId);
     }
