@@ -102,3 +102,55 @@ export function isAdminKey(playerKey: string) {
   const id = playerKey.replace(/^tg_/, "");
   return ids.includes(id) || ids.includes(playerKey);
 }
+
+/**
+ * Confirms an IPN notification with Paykassa. The notification only carries a
+ * `private_hash`; the payment details are fetched from Paykassa itself, so a
+ * forged callback cannot credit anything.
+ */
+export async function confirmPaykassaOrder(privateHash: string): Promise<{
+  orderId: string;
+  amount: number;
+  currency: string;
+  system: string;
+  hash: string;
+  partial: string;
+}> {
+  const sciId = process.env["PAYKASSA_MERCHANT_ID"];
+  const sciKey = process.env["PAYKASSA_MERCHANT_PASSWORD"];
+  if (!sciId || !sciKey) throw new Error("PAYKASSA_NOT_CONFIGURED");
+
+  const res = await fetch(SCI_URL, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      func: "sci_confirm_order",
+      sci_id: sciId,
+      sci_key: sciKey,
+      private_hash: privateHash,
+    }),
+  });
+
+  const text = await res.text();
+  let json: SciResponse;
+  try {
+    json = JSON.parse(text) as SciResponse;
+  } catch {
+    console.error("Paykassa IPN non-JSON response", res.status, text.slice(0, 500));
+    throw new Error("PAYKASSA_BAD_RESPONSE");
+  }
+  if (!res.ok || json.error || !json.data) {
+    console.error("Paykassa IPN rejected", json.message);
+    throw new Error("PAYKASSA_IPN_REJECTED");
+  }
+
+  const d = json.data;
+  return {
+    orderId: String(d["order_id"] ?? ""),
+    amount: Number(d["amount"] ?? 0),
+    currency: String(d["currency"] ?? ""),
+    system: String(d["system"] ?? ""),
+    hash: String(d["hash"] ?? ""),
+    partial: String(d["partial"] ?? "no"),
+  };
+}
