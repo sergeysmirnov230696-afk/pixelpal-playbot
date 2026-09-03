@@ -397,7 +397,7 @@ export const collectIncome = createServerFn({ method: "POST" })
     const db = await admin();
     const { data: player } = await db
       .from("players")
-      .select("id, balance, collected, last_accrual")
+      .select("id, balance, collected, last_accrual, boost_until, boost_multiplier")
       .eq("player_key", data.playerKey)
       .maybeSingle();
     if (!player) throw new Error("Player not found");
@@ -411,6 +411,7 @@ export const collectIncome = createServerFn({ method: "POST" })
       (dragons ?? []) as unknown as DragonRow[],
       player.last_accrual as string,
       now,
+      boostOf(player as unknown as { boost_until?: string | null; boost_multiplier?: number }),
     );
     const settings = await loadSettings();
     if (pending < settings.minCollect) throw new Error("MIN_COLLECT");
@@ -561,3 +562,179 @@ export const savePayoutAddress = createServerFn({ method: "POST" })
     await db.from("players").update({ addresses }).eq("id", player.id as string);
     return snapshot(data.playerKey);
   });
+
+
+/* ---------------------------------------------------------------- features */
+
+export const claimDailyBonus = createServerFn({ method: "POST" })
+  .inputValidator((data: unknown) => keySchema.parse(data))
+  .handler(async ({ data }) => {
+    const db = await admin();
+    const { data: player } = await db
+      .from("players")
+      .select("id, balance, last_daily_at, daily_streak, banned")
+      .eq("player_key", data.playerKey)
+      .maybeSingle();
+    if (!player) throw new Error("Player not found");
+    if (player["banned"]) throw new Error("BANNED");
+
+    const now = Date.now();
+    const last = player["last_daily_at"] ? new Date(player["last_daily_at"] as string).getTime() : 0;
+    if (now - last < 86400000) throw new Error("DAILY_NOT_READY");
+
+    const streak = now - last <= 172800000 ? Math.min(num(player["daily_streak"]) + 1, DAILY_MAX_STREAK) : 1;
+    const reward = dailyReward(streak);
+
+    await db
+      .from("players")
+      .update({
+        balance: +(num(player["balance"]) + reward).toFixed(6),
+        last_daily_at: new Date(now).toISOString(),
+        daily_streak: streak,
+      })
+      .eq("id", player["id"] as string);
+
+    return snapshot(data.playerKey);
+  });
+
+export const buyBoost = createServerFn({ method: "POST" })
+  .inputValidator((data: unknown) =>
+    keySchema.extend({ boostId: z.string().max(24) }).parse(data),
+  )
+  .handler(async ({ data }) => {
+    const spec = BOOSTS.find((b) => b.id === data.boostId);
+    if (!spec) throw new Error("BOOST_UNKNOWN");
+    const db = await admin();
+    const { data: player } = await db
+      .from("players")
+      .select("id, balance, boost_until, boost_multiplier")
+      .eq("player_key", data.playerKey)
+      .maybeSingle();
+    if (!player) throw new Error("Player not found");
+    const balance = num(player["balance"]);
+    if (balance < spec.price) throw new Error("INSUFFICIENT_FUNDS");
+    if (boostOf(player as unknown as { boost_until?: string | null; boost_multiplier?: number })) {
+      throw new Error("BOOST_ACTIVE");
+    }
+
+    await db
+      .from("players")
+      .update({
+        balance: +(balance - spec.price).toFixed(6),
+        boost_until: new Date(Date.now() + spec.hours * 3600000).toISOString(),
+        boost_multiplier: spec.multiplier,
+      })
+      .eq("id", player["id"] as string);
+
+    return snapshot(data.playerKey);
+  });
+
+export const claimAchievement = createServerFn({ method: "POST" })
+  .inputValidator((data: unknown) => keySchema.extend({ key: z.string().max(32) }).parse(data))
+  .handler(async ({ data }) => {
+    const spec = ACHIEVEMENTS.find((a) => a.key === data.key);
+    if (!spec) throw new Error("ACHIEVEMENT_UNKNOWN");
+    const snap = await snapshot(data.playerKey);
+    const item = snap.achievements.find((a) => a.key === data.key);
+    if (!item || item.claimed) throw new Error("ALREADY_CLAIMED");
+    if (!item.ready) throw new Error("NOT_READY");
+
+    const db = await admin();
+    const { data: player } = await db
+      .from("players")
+      .select("id, balance")
+      .eq("player_key", data.playerKey)
+      .maybeSingle();
+    if (!player) throw new Error("Player not found");
+
+    const { error } = await db
+      .from("player_achievements")
+      .insert({ player_id: player["id"] as string, key: spec.key, reward: spec.reward });
+    if (error) throw new Error("ALREADY_CLAIMED");
+
+    await db
+      .from("players")
+      .update({ balance: +(num(player["balance"]) + spec.reward).toFixed(6) })
+      .eq("id", player["id"] as string);
+
+    return snapshot(data.playerKey);
+  });
+
+export const redeemPromo = createServerFn({ method: "POST" })
+  .inputValidator((data: unknown) =>
+    keySchema.extend({ code: z.string().min(2).max(32) }).parse(data),
+  )
+  .handler(async ({ data }) => {
+    const db = await admin();
+    const code = data.code.trim().toUpperCase();
+    const { data: promo } = await db
+      .from("promo_codes")
+      .select("*")
+      .eq("code", code)
+      .maybeSingle();
+    if (!promo || !promo["active"]) throw new Error("PROMO_INVALID");
+    if (promo["expires_at"] && new Date(promo["expires_at"] as string).getTime() < Date.now()) {
+      throw new Error("PROMO_EXPIRED");
+    }
+    if (num(promo["used_count"]) >= num(promo["max_uses"])) throw new Error("PROMO_USED_UP");
+
+    const { data: player } = await db
+      .from("players")
+      .select("id, balance")
+      .eq("player_key", data.playerKey)
+      .maybeSingle();
+    if (!player) throw new Error("Player not found");
+
+    const { error } = await db.from("promo_redemptions").insert({
+      player_id: player["id"] as string,
+      code,
+      amount: num(promo["amount"]),
+    });
+    if (error) throw new Error("PROMO_ALREADY_USED");
+
+    await db
+      .from("players")
+      .update({ balance: +(num(player["balance"]) + num(promo["amount"])).toFixed(6) })
+      .eq("id", player["id"] as string);
+    await db
+      .from("promo_codes")
+      .update({ used_count: num(promo["used_count"]) + 1 })
+      .eq("id", promo["id"] as string);
+
+    return snapshot(data.playerKey);
+  });
+
+export type LeaderRow = { name: string; collected: number; dragons: number };
+export type NewsRow = { id: string; title: string; body: string; createdAt: string };
+
+export const loadCommunity = createServerFn({ method: "GET" }).handler(async () => {
+  const db = await admin();
+  const [{ data: players }, { data: news }] = await Promise.all([
+    db
+      .from("players")
+      .select("name, collected, player_dragons(id)")
+      .order("collected", { ascending: false })
+      .limit(20),
+    db
+      .from("news")
+      .select("*")
+      .eq("active", true)
+      .order("created_at", { ascending: false })
+      .limit(20),
+  ]);
+
+  const leaders: LeaderRow[] = ((players ?? []) as unknown as Record<string, any>[]).map((p) => ({
+    name: (p["name"] as string) ?? "Player",
+    collected: num(p["collected"]),
+    dragons: p["player_dragons"]?.length ?? 0,
+  }));
+
+  const items: NewsRow[] = ((news ?? []) as unknown as Record<string, any>[]).map((n) => ({
+    id: n["id"] as string,
+    title: n["title"] as string,
+    body: n["body"] as string,
+    createdAt: n["created_at"] as string,
+  }));
+
+  return { leaders, news: items };
+});
