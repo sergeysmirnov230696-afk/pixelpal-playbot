@@ -1,6 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { CURRENCY_CODES, DRAGONS, dragonById } from "./dragons";
+import { ACHIEVEMENTS, BOOSTS, dailyReward, DAILY_MAX_STREAK } from "./achievements";
 
 export type PlayerSnapshot = {
   playerKey: string;
@@ -25,6 +26,18 @@ export type PlayerSnapshot = {
     createdAt: string;
   }[];
   referrals: { invitedName: string; deposit: number; income: number; createdAt: string }[];
+  totalDeposited: number;
+  banned: boolean;
+  daily: { streak: number; canClaim: boolean; nextAt: string | null; reward: number };
+  boost: { until: string | null; multiplier: number; active: boolean };
+  achievements: {
+    key: string;
+    goal: number;
+    reward: number;
+    progress: number;
+    claimed: boolean;
+    ready: boolean;
+  }[];
 };
 
 export type GameSettings = {
@@ -84,7 +97,12 @@ function num(v: number | string | null) {
   return Number(v ?? 0);
 }
 
-function accrual(rows: DragonRow[], lastAccrual: string, now: number) {
+function accrual(
+  rows: DragonRow[],
+  lastAccrual: string,
+  now: number,
+  boost?: { until: number; multiplier: number },
+) {
   let pending = 0;
   let perSecond = 0;
   const last = new Date(lastAccrual).getTime();
@@ -97,9 +115,24 @@ function accrual(rows: DragonRow[], lastAccrual: string, now: number) {
     if (now < end) perSecond += perDay / 86400;
     const from = Math.max(bought, last);
     const to = Math.min(now, end);
-    if (to > from) pending += ((to - from) / 86400000) * perDay;
+    if (to > from) {
+      pending += ((to - from) / 86400000) * perDay;
+      // Boost pays the extra multiplier only for the part of the window it covers.
+      if (boost && boost.multiplier > 1) {
+        const bTo = Math.min(to, boost.until);
+        if (bTo > from) pending += ((bTo - from) / 86400000) * perDay * (boost.multiplier - 1);
+      }
+    }
   }
+  if (boost && boost.multiplier > 1 && boost.until > now) perSecond *= boost.multiplier;
   return { pending, perSecond };
+}
+
+function boostOf(player: { boost_until?: string | null; boost_multiplier?: number | string | null }) {
+  const until = player.boost_until ? new Date(player.boost_until).getTime() : 0;
+  const multiplier = Number(player.boost_multiplier ?? 1) || 1;
+  if (!until || until <= Date.now() || multiplier <= 1) return undefined;
+  return { until, multiplier };
 }
 
 async function snapshot(playerKey: string): Promise<PlayerSnapshot> {
@@ -132,7 +165,30 @@ async function snapshot(playerKey: string): Promise<PlayerSnapshot> {
   const dragonRows = (dragons ?? []) as unknown as DragonRow[];
   const [settings, { isAdminKey }] = await Promise.all([loadSettings(), pk()]);
   const now = Date.now();
-  const { pending, perSecond } = accrual(dragonRows, p.last_accrual, now);
+  const boost = boostOf(player as unknown as { boost_until?: string | null; boost_multiplier?: number });
+  const { pending, perSecond } = accrual(dragonRows, p.last_accrual, now, boost);
+
+  const { data: claimedRows } = await db
+    .from("player_achievements")
+    .select("key")
+    .eq("player_id", p.id);
+  const claimedKeys = new Set((claimedRows ?? []).map((r) => r["key"] as string));
+
+  const row = player as unknown as Record<string, unknown>;
+  const streak = Number(row["daily_streak"] ?? 0);
+  const lastDaily = row["last_daily_at"] ? new Date(row["last_daily_at"] as string).getTime() : 0;
+  const canClaim = now - lastDaily >= 86400000;
+  const nextStreak = now - lastDaily <= 172800000 ? streak + 1 : 1;
+  const totalDeposited = num(row["total_deposited"] as number);
+  const refCount = (refs ?? []).length;
+
+  const metrics: Record<string, number> = {
+    dragons: dragonRows.length,
+    deposited: totalDeposited,
+    referrals: refCount,
+    streak,
+    collected: num(p.collected),
+  };
 
   return {
     playerKey: p.player_key,
@@ -166,6 +222,31 @@ async function snapshot(playerKey: string): Promise<PlayerSnapshot> {
       income: num(r.income as number),
       createdAt: r.created_at as string,
     })),
+    totalDeposited,
+    banned: Boolean(row["banned"]),
+    daily: {
+      streak,
+      canClaim,
+      nextAt: lastDaily ? new Date(lastDaily + 86400000).toISOString() : null,
+      reward: dailyReward(nextStreak),
+    },
+    boost: {
+      until: boost ? new Date(boost.until).toISOString() : null,
+      multiplier: boost?.multiplier ?? 1,
+      active: Boolean(boost),
+    },
+    achievements: ACHIEVEMENTS.map((a) => {
+      const progress = metrics[a.metric] ?? 0;
+      const claimed = claimedKeys.has(a.key);
+      return {
+        key: a.key,
+        goal: a.goal,
+        reward: a.reward,
+        progress,
+        claimed,
+        ready: !claimed && progress >= a.goal,
+      };
+    }),
   };
 }
 
